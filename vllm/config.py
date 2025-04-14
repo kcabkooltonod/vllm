@@ -3653,12 +3653,12 @@ class VllmConfig:
 
             if capability_tuple is not None:
                 capability = capability_tuple.to_int()
-                if capability < quant_config.get_min_capability():
-                    raise ValueError(
-                        f"The quantization method {model_config.quantization} "
-                        "is not supported for the current GPU. Minimum "
-                        f"capability: {quant_config.get_min_capability()}. "
-                        f"Current capability: {capability}.")
+                # if capability < quant_config.get_min_capability():
+                #     raise ValueError(
+                #         f"The quantization method {model_config.quantization} "
+                #         "is not supported for the current GPU. Minimum "
+                #         f"capability: {quant_config.get_min_capability()}. "
+                #         f"Current capability: {capability}.")
             supported_dtypes = quant_config.get_supported_act_dtypes()
             if model_config.dtype not in supported_dtypes:
                 raise ValueError(

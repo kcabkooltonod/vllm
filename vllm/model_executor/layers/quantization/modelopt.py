@@ -263,9 +263,9 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
     def __init__(self, quant_config: ModelOptNvFp4Config):
         self.quant_config = quant_config
         self.cutlass_nvfp4_supported = cutlass_fp4_supported()
-        if not self.cutlass_nvfp4_supported:
-            raise ValueError("Current platform does not support NVFP4"
-                             " quantization. Please use Blackwell and above.")
+        # if not self.cutlass_nvfp4_supported:
+        #     raise ValueError("Current platform does not support NVFP4"
+        #                      " quantization. Please use Blackwell and above.")
 
     def create_weights(
         self,
@@ -377,6 +377,55 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
         layer.weight_scale_swizzled = Parameter(swizzled_weight_scale,
                                                 requires_grad=False)
 
+
+    def unpack_uint8_to_fp4(self, x: torch.Tensor) -> torch.Tensor:
+        assert x.dtype == torch.uint8, "Input tensor must be of type torch.uint8"
+        
+        low = x & 0x0F
+        high = (x >> 4) & 0x0F
+        unpacked = torch.stack([low, high], dim=-1).view(*x.shape[:-1], -1)
+        
+        original_shape = unpacked.shape
+        unpacked_flat = unpacked.view(-1)
+        
+        s = (unpacked_flat >> 3) & 0x01
+        e_code = (unpacked_flat >> 1) & 0x03
+        m = unpacked_flat & 0x01
+        
+        s = s.float()
+        e_code = e_code.int()
+        m = m.float()
+        
+        val_subnormal = m * 0.5  # 0.5（尾数） * 2^-1（指数）
+        exponent = (e_code - 1).float()
+        val_normal = (1.0 + m * 0.5) * torch.pow(2.0, exponent)
+        
+        e_code_zero = (e_code == 0)
+        val = torch.where(e_code_zero, val_subnormal, val_normal)
+        
+        val = val * torch.where(s > 0.5, -1.0, 1.0)
+        
+        val_fp16 = val.to(torch.half)
+        val_fp16 = val_fp16.view(original_shape)
+        
+        return val_fp16
+
+    def dequantize_w(self, w, w_block_scale, w_global_scale, group_size):
+
+        w = self.unpack_uint8_to_fp4(w)
+        w = w.float()
+        # print(w)
+        w_block_scale = w_block_scale.float()
+
+        for i in range(w_block_scale.shape[-1]):
+            start = i * group_size
+            end = start + group_size
+            w[:, start:end] = (w[:, start:end] * w_block_scale[:, i:i + 1])
+        
+        w = w * w_global_scale
+
+        return w.bfloat16()
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -387,24 +436,28 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
 
         # for input only the contracting dimension has a constraint.
         x_m, _ = x.shape
+        # print(layer)
         w_n, _ = layer.weight.shape
         output_shape = [x_m, w_n]
 
         # quantize BF16 or FP16 to (FP4 and interleaved block scale)
-        s_quant = 1 / layer.input_scale
-        x_fp4, x_blockscale = scaled_fp4_quant(x, s_quant)
+        # s_quant = 1 / layer.input_scale
+        # x_fp4, x_blockscale = scaled_fp4_quant(x, s_quant)
 
         # validate dtypes of quantized input, input block scale,
         # weight and weight_blockscale
-        assert (x_fp4.dtype == torch.uint8)
+        # assert (x_fp4.dtype == torch.uint8)
         assert (layer.weight.dtype == torch.uint8)
-        assert (x_blockscale.dtype == torch.float8_e4m3fn)
+        # assert (x_blockscale.dtype == torch.float8_e4m3fn)
         assert (layer.weight_scale_swizzled.dtype == torch.float8_e4m3fn)
         assert (layer.alpha.dtype == torch.float32)
 
-        out = cutlass_scaled_fp4_mm(x_fp4, layer.weight, x_blockscale,
-                                    layer.weight_scale_swizzled, layer.alpha,
-                                    output_dtype)
+        # out = cutlass_scaled_fp4_mm(x_fp4, layer.weight, x_blockscale,
+        #                             layer.weight_scale_swizzled, layer.alpha,
+        #                             output_dtype)
+        weight = self.dequantize_w(layer.weight, layer.weight_scale, layer.weight_scale_2, 16)
+        out = torch.nn.functional.linear(x, weight)
+
         if bias is not None:
             out = out + bias
         return out.view(*output_shape)
